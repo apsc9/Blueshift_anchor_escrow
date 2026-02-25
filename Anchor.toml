@@ -1,13 +1,13 @@
 [toolchain]
-package_manager = "yarn"
 anchor_version = "0.31.1"
+package_manager = "yarn"
 
 [features]
 resolution = true
 skip-lint = false
 
 [programs.localnet]
-blueshift_anchor_escrow = "2EUh93KfVGtNfQwbojcgYhHaLNaVQ1VRL9PUsAgjijQ3"
+blueshift_anchor_escrow = "EuAQ3zNBHTPeUhFNbM6PsRr1dW6Q1eH4PrRzUz32iW8c"
 
 [registry]
 url = "https://api.apr.dev"

@@ -6,6 +6,8 @@
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.31.1",
+    "@solana/spl-token": "0.4.13",
+    "@solana/web3.js": "1.98.4",
     "solana-edition-fixer": "^1.0.0"
   },
   "devDependencies": {
