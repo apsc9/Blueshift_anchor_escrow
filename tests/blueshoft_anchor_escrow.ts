@@ -17,7 +17,7 @@ import assert from "assert";
 type BNType = InstanceType<typeof BN>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SHARED HELPER
+// SHARED HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -35,6 +35,19 @@ function deriveEscrowPda(
       makerKey.toBuffer(),
       seed.toArrayLike(Buffer, "le", 8), // u64 little-endian, 8 bytes — must match Rust
     ],
+    programId
+  );
+  return pda;
+}
+
+/**
+ * Derive the Treasury PDA — mirrors the Rust seeds: [b"treasury"]
+ */
+function deriveTreasuryPda(
+  programId: anchor.web3.PublicKey
+): anchor.web3.PublicKey {
+  const [pda] = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("treasury")],
     programId
   );
   return pda;
@@ -81,13 +94,14 @@ describe("make instruction", () => {
   // Default expiry: 1 hour from now
   const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
 
-  const makeTx = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType) => {
+  const makeTx = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType, feeBps?: number) => {
     const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
     const expiry = expiresAt ?? DEFAULT_EXPIRY();
+    const fee = feeBps ?? 0;
 
     await program.methods
-      .make(seed, receive, amount, expiry)
+      .make(seed, receive, amount, expiry, fee)
       .accounts({
         maker: maker.publicKey,
         mintA,
@@ -285,13 +299,14 @@ describe("take instruction", () => {
   const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
 
   // ── Helper: create a fresh make() escrow ─────────────────────────────────
-  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType) => {
+  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType, feeBps?: number) => {
     const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
     const expiry = expiresAt ?? DEFAULT_EXPIRY();
+    const fee = feeBps ?? 0;
 
     await program.methods
-      .make(seed, receive, amount, expiry)
+      .make(seed, receive, amount, expiry, fee)
       .accounts({
         maker: maker.publicKey,
         mintA,
@@ -323,19 +338,23 @@ describe("take instruction", () => {
     const takerAtaA = await getAssociatedTokenAddress(aMintA, aTaker.publicKey);
     const aTakerAtaB = await getAssociatedTokenAddress(aMintB, aTaker.publicKey);
     const makerAtaB = await getAssociatedTokenAddress(aMintB, aMaker);
+    const treasury = deriveTreasuryPda(program.programId);
+    const treasuryAtaB = await getAssociatedTokenAddress(aMintB, treasury, true);
 
     await program.methods
       .take()
       .accounts({
         taker: aTaker.publicKey,
-        maker: aMaker,         // Anchor needs maker so it can derive makerAtaB
-        escrow: escrowPda,      // needed so Anchor reads escrow.maker via relations
+        maker: aMaker,
+        escrow: escrowPda,
         mintA: aMintA,
         mintB: aMintB,
-        vault,                    // ATA(mintA, escrow)
-        takerAtaA,                // ATA(mintA, taker)  — init_if_needed target
-        takerAtaB: aTakerAtaB,    // ATA(mintB, taker)  — source of payment, mut required
-        makerAtaB,                // ATA(mintB, maker)  — init_if_needed target
+        vault,
+        takerAtaA,
+        takerAtaB: aTakerAtaB,
+        makerAtaB,
+        treasury,
+        treasuryAtaB,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: anchor.web3.SystemProgram.programId,
@@ -343,7 +362,7 @@ describe("take instruction", () => {
       .signers([aTaker])
       .rpc();
 
-    return { vault, takerAtaA, makerAtaB, takerAtaB: aTakerAtaB };
+    return { vault, takerAtaA, makerAtaB, takerAtaB: aTakerAtaB, treasuryAtaB };
   };
 
   // ── BEFORE ────────────────────────────────────────────────────────────────
@@ -571,13 +590,14 @@ describe("refund instruction", () => {
   // Default expiry: 1 hour from now
   const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
 
-  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType) => {
+  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType, feeBps?: number) => {
     const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
     const expiry = expiresAt ?? DEFAULT_EXPIRY();
+    const fee = feeBps ?? 0;
 
     await program.methods
-      .make(seed, receive, amount, expiry)
+      .make(seed, receive, amount, expiry, fee)
       .accounts({
         maker: maker.publicKey,
         mintA,
@@ -810,13 +830,14 @@ describe("cross-instruction lifecycle", () => {
   const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
 
   // ── Helper: create escrow via make() ──────────────────────────────────────
-  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType) => {
+  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType, feeBps?: number) => {
     const escrowPda = deriveEscrowPda(maker.publicKey, seed);
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
     const expiry = expiresAt ?? DEFAULT_EXPIRY();
+    const fee = feeBps ?? 0;
 
     await program.methods
-      .make(seed, receive, amount, expiry)
+      .make(seed, receive, amount, expiry, fee)
       .accounts({
         maker: maker.publicKey,
         mintA,
@@ -834,6 +855,8 @@ describe("cross-instruction lifecycle", () => {
     const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
     const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
     const makerAtaB = await getAssociatedTokenAddress(mintB, maker.publicKey);
+    const treasury = deriveTreasuryPda(program.programId);
+    const treasuryAtaB = await getAssociatedTokenAddress(mintB, treasury, true);
 
     await program.methods
       .take()
@@ -847,6 +870,8 @@ describe("cross-instruction lifecycle", () => {
         takerAtaA,
         takerAtaB: activeTakerAtaB,
         makerAtaB,
+        treasury,
+        treasuryAtaB,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: anchor.web3.SystemProgram.programId,
@@ -898,7 +923,7 @@ describe("cross-instruction lifecycle", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST 17 ❌ — Take after Refund must fail
+  // TEST 17  — Take after Refund must fail
   // ───────────────────────────────────────────────────────────────────────────
   //
   // Scenario:
@@ -960,7 +985,7 @@ describe("cross-instruction lifecycle", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST 18 ❌ — Refund after Take must fail
+  // TEST 18  — Refund after Take must fail
   // ───────────────────────────────────────────────────────────────────────────
   //
   // Scenario:
@@ -1060,13 +1085,15 @@ describe("expiry / deadline", () => {
     seed: BNType,
     receive: BNType,
     amount: BNType,
-    expiresAt: BNType // required here — tests set explicit values
+    expiresAt: BNType, // required here — tests set explicit values
+    feeBps?: number
   ) => {
     const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const fee = feeBps ?? 0;
 
     await program.methods
-      .make(seed, receive, amount, expiresAt)
+      .make(seed, receive, amount, expiresAt, fee)
       .accounts({
         maker: maker.publicKey,
         mintA,
@@ -1084,6 +1111,8 @@ describe("expiry / deadline", () => {
     const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
     const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
     const makerAtaB = await getAssociatedTokenAddress(mintB, maker.publicKey);
+    const treasury = deriveTreasuryPda(program.programId);
+    const treasuryAtaB = await getAssociatedTokenAddress(mintB, treasury, true);
 
     await program.methods
       .take()
@@ -1097,6 +1126,8 @@ describe("expiry / deadline", () => {
         takerAtaA,
         takerAtaB: activeTakerAtaB,
         makerAtaB,
+        treasury,
+        treasuryAtaB,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: anchor.web3.SystemProgram.programId,
@@ -1148,7 +1179,7 @@ describe("expiry / deadline", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST 19 ✅ — Happy path: escrow with future expiry, take succeeds
+  // TEST 19  — Happy path: escrow with future expiry, take succeeds
   // ───────────────────────────────────────────────────────────────────────────
   it("happy path: take succeeds when escrow has not expired", async () => {
     // Expiry 1 hour from now — well in the future
@@ -1175,7 +1206,7 @@ describe("expiry / deadline", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST 20 ❌ — make() with expiry in the past must fail (ExpiryInPast)
+  // TEST 20  — make() with expiry in the past must fail (ExpiryInPast)
   // ───────────────────────────────────────────────────────────────────────────
   it("make rejects expires_at in the past (ExpiryInPast)", async () => {
     // Set expiry to 1 hour AGO — clearly in the past
@@ -1195,7 +1226,7 @@ describe("expiry / deadline", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST 21 ❌ — take() on an expired escrow must fail (EscrowExpired)
+  // TEST 21  — take() on an expired escrow must fail (EscrowExpired)
   // ───────────────────────────────────────────────────────────────────────────
   //
   // Strategy: We create an escrow with `expires_at` set to just 2 seconds
@@ -1231,7 +1262,7 @@ describe("expiry / deadline", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST 22 ✅ — refund() works EVEN on an expired escrow
+  // TEST 22  — refund() works EVEN on an expired escrow
   // ───────────────────────────────────────────────────────────────────────────
   //
   // The maker should ALWAYS be able to get their tokens back, regardless of
@@ -1269,5 +1300,210 @@ describe("expiry / deadline", () => {
     // Escrow closed
     const escrowInfo = await provider.connection.getAccountInfo(escrowPda);
     assert.strictEqual(escrowInfo, null, "Escrow PDA should be closed after refund");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DESCRIBE: FEE MECHANISM TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests validate the protocol fee mechanism:
+//   - Maker sets `fee_bps` at make() time (0–10000 = 0%–100%)
+//   - On take(), fee = (receive * fee_bps) / 10_000
+//   - Taker sends (receive - fee) to maker, fee to treasury ATA
+//   - fee_bps = 0 → no fee (backward compatible)
+//   - fee_bps > 10000 → rejected (InvalidFeeBps)
+//
+// Seed range: 500–510
+// ─────────────────────────────────────────────────────────────────────────────
+describe("fee mechanism", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace
+    .BlueshiftAnchorEscrow as Program<BlueshiftAnchorEscrow>;
+
+  const maker = provider.wallet;
+  const taker = anchor.web3.Keypair.generate();
+  const payer = anchor.web3.Keypair.generate();
+
+  let mintA: anchor.web3.PublicKey;
+  let mintB: anchor.web3.PublicKey;
+  let makerAtaA: anchor.web3.PublicKey;
+  let takerAtaB: anchor.web3.PublicKey;
+
+  const DEPOSIT_AMOUNT = new BN(1_000_000); // 1 token (6 decimals)
+  const RECEIVE_AMOUNT = new BN(500_000);   // 0.5 token (6 decimals)
+
+  const confirmTx = async (sig: string) => {
+    const bh = await provider.connection.getLatestBlockhash();
+    await provider.connection.confirmTransaction({ signature: sig, ...bh });
+  };
+
+  const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
+
+  // ── Helper: create escrow via make() ──────────────────────────────────────
+  const setupEscrow = async (
+    seed: BNType,
+    receive: BNType,
+    amount: BNType,
+    feeBps: number,
+    expiresAt?: BNType
+  ) => {
+    const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const expiry = expiresAt ?? DEFAULT_EXPIRY();
+
+    await program.methods
+      .make(seed, receive, amount, expiry, feeBps)
+      .accounts({
+        maker: maker.publicKey,
+        mintA,
+        mintB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      } as any)
+      .rpc();
+
+    return { escrowPda, vault };
+  };
+
+  // ── Helper: call take() ───────────────────────────────────────────────────
+  const takeTx = async (escrowPda: anchor.web3.PublicKey) => {
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
+    const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
+    const makerAtaB = await getAssociatedTokenAddress(mintB, maker.publicKey);
+    const treasury = deriveTreasuryPda(program.programId);
+    const treasuryAtaB = await getAssociatedTokenAddress(mintB, treasury, true);
+
+    await program.methods
+      .take()
+      .accounts({
+        taker: taker.publicKey,
+        maker: maker.publicKey,
+        escrow: escrowPda,
+        mintA,
+        mintB,
+        vault,
+        takerAtaA,
+        takerAtaB: activeTakerAtaB,
+        makerAtaB,
+        treasury,
+        treasuryAtaB,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      } as any)
+      .signers([taker])
+      .rpc();
+
+    return { vault, takerAtaA, makerAtaB, takerAtaB: activeTakerAtaB, treasuryAtaB };
+  };
+
+  // ── BEFORE ──────────────────────────────────────────────────────────────────
+  before(async () => {
+    const [payerSig, takerSig] = await Promise.all([
+      provider.connection.requestAirdrop(payer.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
+      provider.connection.requestAirdrop(taker.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
+    ]);
+    await confirmTx(payerSig);
+    await confirmTx(takerSig);
+
+    mintA = await createMint(provider.connection, payer, payer.publicKey, null, 6);
+    mintB = await createMint(provider.connection, payer, payer.publicKey, null, 6);
+
+    makerAtaA = (await getOrCreateAssociatedTokenAccount(
+      provider.connection, payer, mintA, maker.publicKey
+    )).address;
+    await mintTo(provider.connection, payer, mintA, makerAtaA, payer.publicKey, 10_000_000_000n);
+
+    takerAtaB = (await getOrCreateAssociatedTokenAccount(
+      provider.connection, payer, mintB, taker.publicKey
+    )).address;
+    await mintTo(provider.connection, payer, mintB, takerAtaB, payer.publicKey, 10_000_000_000n);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 23  — Happy path: 250 bps (2.5%) fee deducted, treasury receives fee
+  // ───────────────────────────────────────────────────────────────────────────
+  it("happy path: 250 bps fee — maker gets (receive - fee), treasury gets fee", async () => {
+    const FEE_BPS = 250; // 2.5%
+    // fee = (500_000 * 250) / 10_000 = 12_500
+    // maker gets = 500_000 - 12_500 = 487_500
+
+    const { escrowPda } = await setupEscrow(
+      new BN(500), RECEIVE_AMOUNT, DEPOSIT_AMOUNT, FEE_BPS
+    );
+
+    // Verify fee_bps stored in escrow state
+    const escrow = await program.account.escrow.fetch(escrowPda);
+    assert.equal(escrow.feeBps, FEE_BPS, "fee_bps should be stored in escrow");
+
+    const takerBBefore = (await getAccount(provider.connection, takerAtaB)).amount;
+
+    const { makerAtaB, treasuryAtaB } = await takeTx(escrowPda);
+
+    // [1] maker received (receive - fee) = 487_500
+    const makerAtaBAcc = await getAccount(provider.connection, makerAtaB);
+    assert.equal(
+      makerAtaBAcc.amount,
+      BigInt(487_500),
+      "Maker should receive receive minus fee"
+    );
+
+    // [2] treasury received fee = 12_500
+    const treasuryAtaBAcc = await getAccount(provider.connection, treasuryAtaB);
+    assert.equal(
+      treasuryAtaBAcc.amount,
+      BigInt(12_500),
+      "Treasury should receive the fee"
+    );
+
+    // [3] taker paid the full receive amount (fee comes out of what goes to maker)
+    const takerBAfter = (await getAccount(provider.connection, takerAtaB)).amount;
+    assert.equal(
+      takerBAfter,
+      takerBBefore - BigInt(RECEIVE_AMOUNT.toString()),
+      "Taker should pay the full receive amount"
+    );
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 24  — Zero fee (fee_bps = 0): backward compatible, no treasury transfer
+  // ───────────────────────────────────────────────────────────────────────────
+  it("fee_bps = 0: full amount goes to maker, no treasury transfer", async () => {
+    const { escrowPda } = await setupEscrow(
+      new BN(501), RECEIVE_AMOUNT, DEPOSIT_AMOUNT, 0
+    );
+
+    const { makerAtaB } = await takeTx(escrowPda);
+
+    // Maker gets the full receive amount
+    const makerAtaBAcc = await getAccount(provider.connection, makerAtaB);
+    // Note: makerAtaB may have accumulated from test 23. Check that the increment equals RECEIVE_AMOUNT.
+    // But since this is a different describe block with fresh mints, makerAtaB was created fresh by init_if_needed in test 23.
+    // After test 23: makerAtaB = 487_500. After this test: makerAtaB = 487_500 + 500_000 = 987_500
+    assert.equal(
+      makerAtaBAcc.amount,
+      BigInt(487_500 + 500_000),
+      "Maker should receive full amount when fee is 0"
+    );
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 25  — fee_bps > 10000 must fail (InvalidFeeBps)
+  // ───────────────────────────────────────────────────────────────────────────
+  it("fee_bps > 10000 is rejected with InvalidFeeBps", async () => {
+    try {
+      await setupEscrow(new BN(502), RECEIVE_AMOUNT, DEPOSIT_AMOUNT, 10_001);
+      assert.fail("make() should have rejected fee_bps > 10000");
+    } catch (err) {
+      assert.ok(err instanceof AnchorError, `Expected AnchorError, got: ${err}`);
+      assert.strictEqual(
+        err.error.errorCode.code,
+        "InvalidFeeBps",
+        `Expected InvalidFeeBps, got: ${err.error.errorCode.code}`
+      );
+    }
   });
 });

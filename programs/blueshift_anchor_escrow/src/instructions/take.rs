@@ -55,6 +55,21 @@ pub struct Take<'info> {
     )]
     pub maker_ata_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
+    /// CHECK: This is a PDA used only as the authority/owner for treasury token accounts.
+    #[account(
+        seeds = [b"treasury"],
+        bump,
+    )]
+    pub treasury: AccountInfo<'info>,
+    #[account(
+        init_if_needed,
+        payer = taker,
+        associated_token::mint = mint_b,
+        associated_token::authority = treasury,
+        associated_token::token_program = token_program,
+    )]
+    pub treasury_ata_b: Box<InterfaceAccount<'info, TokenAccount>>,
+
     //programs
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub token_program: Interface<'info, TokenInterface>,
@@ -62,7 +77,20 @@ pub struct Take<'info> {
 }
 
 impl<'info> Take<'info> {
+    // transfer token_b to maker (minus fee) and fee to treasury
     fn transfer_to_maker(&mut self) -> Result<()> {
+        let receive = self.escrow.receive;
+        let fee_bps = self.escrow.fee_bps as u64;
+
+        // fee = (receive * fee_bps) / 10_000
+        let fee = receive
+            .checked_mul(fee_bps)
+            .unwrap()
+            .checked_div(10_000)
+            .unwrap();
+        let maker_amount = receive.checked_sub(fee).unwrap();
+
+        // transfer (receive - fee) to maker
         transfer_checked(
             CpiContext::new(
                 self.token_program.to_account_info(),
@@ -73,9 +101,27 @@ impl<'info> Take<'info> {
                     authority: self.taker.to_account_info(),
                 },
             ),
-            self.escrow.receive,
+            maker_amount,
             self.mint_b.decimals,
         )?;
+
+        // transfer fee to treasury (skip if fee is 0)
+        if fee > 0 {
+            transfer_checked(
+                CpiContext::new(
+                    self.token_program.to_account_info(),
+                    TransferChecked {
+                        from: self.taker_ata_b.to_account_info(),
+                        to: self.treasury_ata_b.to_account_info(),
+                        mint: self.mint_b.to_account_info(),
+                        authority: self.taker.to_account_info(),
+                    },
+                ),
+                fee,
+                self.mint_b.decimals,
+            )?;
+        }
+
         Ok(())
     }
 
