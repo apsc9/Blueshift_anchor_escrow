@@ -63,7 +63,7 @@ pub struct Make<'info> {
 
 impl <'info> Make<'info> {
     // create escrow 
-    fn populate_escrow(&mut self, seed: u64, amount: u64, bump: u8) -> Result<()> {
+    fn populate_escrow(&mut self, seed: u64, amount: u64, bump: u8, expires_at: i64) -> Result<()> {
         self.escrow.set_inner(Escrow {
             seed,
             maker: self.maker.key(),
@@ -71,6 +71,7 @@ impl <'info> Make<'info> {
             mint_b: self.mint_b.key(),
             receive: amount,
             bump,
+            expires_at,
         });
         Ok(())
     }
@@ -94,12 +95,16 @@ impl <'info> Make<'info> {
     }
 }
 
-pub fn handler (ctx: Context<Make>, seed: u64, receive: u64, amount: u64) -> Result<()> {
+pub fn handler (ctx: Context<Make>, seed: u64, receive: u64, amount: u64, expires_at: i64) -> Result<()> {
     // constraints to avoid zero values
     require!(receive > 0, EscrowError::InvalidAmount);
     require!(amount > 0, EscrowError::InvalidAmount);
 
-    ctx.accounts.populate_escrow(seed, receive, ctx.bumps.escrow)?;
+    // validate expiry is in the future
+    let clock = Clock::get()?;
+    require!(expires_at > clock.unix_timestamp, EscrowError::ExpiryInPast);
+
+    ctx.accounts.populate_escrow(seed, receive, ctx.bumps.escrow, expires_at)?;
     ctx.accounts.deposit_tokens(amount)?;
 
     Ok(())

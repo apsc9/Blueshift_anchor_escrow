@@ -121,6 +121,10 @@ impl<'info> Take<'info> {
 }
 
 pub fn handler(ctx: Context<Take>) -> Result<()> {
+    // check if escrow has expired — only live escrows can be taken
+    let clock = Clock::get()?;
+    require!(clock.unix_timestamp < ctx.accounts.escrow.expires_at, EscrowError::EscrowExpired);
+
     // transfer token B to maker
     ctx.accounts.transfer_to_maker()?;
 

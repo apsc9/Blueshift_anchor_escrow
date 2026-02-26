@@ -9,5 +9,8 @@ pub enum EscrowError {
     InvalidMintA,
     #[msg("Invalid mint_b")]
     InvalidMintB,
-    
+    #[msg("Escrow has expired")]
+    EscrowExpired,
+    #[msg("Expiry must be in the future")]
+    ExpiryInPast,
 }

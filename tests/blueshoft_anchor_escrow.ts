@@ -78,12 +78,16 @@ describe("make instruction", () => {
   // In Anchor 0.31, escrow, vault, and makerAtaA are auto-resolved from their
   // PDA seeds defined in the IDL. We only need to pass accounts Anchor can't
   // figure out on its own: maker, mintA, mintB, tokenProgram.
-  const makeTx = async (seed: BNType, receive: BNType, amount: BNType) => {
+  // Default expiry: 1 hour from now
+  const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
+
+  const makeTx = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType) => {
     const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const expiry = expiresAt ?? DEFAULT_EXPIRY();
 
     await program.methods
-      .make(seed, receive, amount)
+      .make(seed, receive, amount, expiry)
       .accounts({
         maker: maker.publicKey,
         mintA,
@@ -277,13 +281,17 @@ describe("take instruction", () => {
     await provider.connection.confirmTransaction({ signature: sig, ...bh });
   };
 
+  // Default expiry: 1 hour from now
+  const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
+
   // ── Helper: create a fresh make() escrow ─────────────────────────────────
-  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType) => {
+  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType) => {
     const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const expiry = expiresAt ?? DEFAULT_EXPIRY();
 
     await program.methods
-      .make(seed, receive, amount)
+      .make(seed, receive, amount, expiry)
       .accounts({
         maker: maker.publicKey,
         mintA,
@@ -560,12 +568,16 @@ describe("refund instruction", () => {
     await provider.connection.confirmTransaction({ signature: sig, ...bh });
   };
 
-  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType) => {
+  // Default expiry: 1 hour from now
+  const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
+
+  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType) => {
     const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const expiry = expiresAt ?? DEFAULT_EXPIRY();
 
     await program.methods
-      .make(seed, receive, amount)
+      .make(seed, receive, amount, expiry)
       .accounts({
         maker: maker.publicKey,
         mintA,
@@ -704,9 +716,9 @@ describe("refund instruction", () => {
 
     try {
       await refundTx(escrowPda, { mintAOver: fakeMintA });
-      assert.fail("Expected rejection but transaction succeeded");
+      assert.fail("Expected InvalidMintA but succeeded");
     } catch (err) {
-      // Same as TAKE-3: vault for fakeMintA doesn't exist → AccountNotInitialized
+      // Same as Test-12: vault for fakeMintA doesn't exist → AccountNotInitialized
       // fires before the has_one = mint_a constraint can run.
       assert.ok(err instanceof AnchorError, `Expected AnchorError, got: ${err}`);
       const code = err.error.errorCode.code;
@@ -742,5 +754,520 @@ describe("refund instruction", () => {
     // Escrow closed
     const escrowInfo = await provider.connection.getAccountInfo(escrowPda);
     assert.strictEqual(escrowInfo, null, "Escrow PDA should be closed");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DESCRIBE: CROSS-INSTRUCTION LIFECYCLE TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests prove that once an escrow is closed (by either take or refund),
+// the opposing action can NEVER replay it. This is the double-spend prevention
+// guarantee — arguably the most critical security property of the entire program.
+//
+// Why these are their own describe block:
+//   They need BOTH taker AND maker infrastructure (mints, ATAs, SOL).
+//   Rather than nesting them inside take or refund, a standalone suite makes
+//   the intent clear: these test the interaction BETWEEN instructions.
+//
+// Seed range: 300–310 (isolated from make=1–20, take=100–110, refund=200–210)
+// ─────────────────────────────────────────────────────────────────────────────
+describe("cross-instruction lifecycle", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace
+    .BlueshiftAnchorEscrow as Program<BlueshiftAnchorEscrow>;
+
+  const maker = provider.wallet;
+  const taker = anchor.web3.Keypair.generate();
+  const payer = anchor.web3.Keypair.generate();
+
+  let mintA: anchor.web3.PublicKey;
+  let mintB: anchor.web3.PublicKey;
+  let makerAtaA: anchor.web3.PublicKey;
+  let takerAtaB: anchor.web3.PublicKey;
+
+  const DEPOSIT_AMOUNT = new BN(500_000);
+  const RECEIVE_AMOUNT = new BN(200_000);
+
+  const confirmTx = async (sig: string) => {
+    const bh = await provider.connection.getLatestBlockhash();
+    await provider.connection.confirmTransaction({ signature: sig, ...bh });
+  };
+
+  const deriveEscrowPda = (makerKey: anchor.web3.PublicKey, seed: BNType) =>
+    anchor.web3.PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("escrow"),
+        makerKey.toBuffer(),
+        seed.toArrayLike(Buffer, "le", 8),
+      ],
+      program.programId
+    )[0];
+
+  // Default expiry: 1 hour from now
+  const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
+
+  // ── Helper: create escrow via make() ──────────────────────────────────────
+  const setupEscrow = async (seed: BNType, receive: BNType, amount: BNType, expiresAt?: BNType) => {
+    const escrowPda = deriveEscrowPda(maker.publicKey, seed);
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const expiry = expiresAt ?? DEFAULT_EXPIRY();
+
+    await program.methods
+      .make(seed, receive, amount, expiry)
+      .accounts({
+        maker: maker.publicKey,
+        mintA,
+        mintB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      } as any)
+      .rpc();
+
+    return { escrowPda, vault };
+  };
+
+  // ── Helper: call take() ───────────────────────────────────────────────────
+  const takeTx = async (escrowPda: anchor.web3.PublicKey) => {
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
+    const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
+    const makerAtaB = await getAssociatedTokenAddress(mintB, maker.publicKey);
+
+    await program.methods
+      .take()
+      .accounts({
+        taker: taker.publicKey,
+        maker: maker.publicKey,
+        escrow: escrowPda,
+        mintA,
+        mintB,
+        vault,
+        takerAtaA,
+        takerAtaB: activeTakerAtaB,
+        makerAtaB,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      } as any)
+      .signers([taker])
+      .rpc();
+  };
+
+  // ── Helper: call refund() ─────────────────────────────────────────────────
+  const refundTx = async (escrowPda: anchor.web3.PublicKey) => {
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+
+    await program.methods
+      .refund()
+      .accounts({
+        maker: maker.publicKey,
+        escrow: escrowPda,
+        mintA,
+        vault,
+        makerAtaA: await getAssociatedTokenAddress(mintA, maker.publicKey),
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      } as any)
+      .rpc();
+  };
+
+  // ── BEFORE ──────────────────────────────────────────────────────────────────
+  before(async () => {
+    const [payerSig, takerSig] = await Promise.all([
+      provider.connection.requestAirdrop(payer.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
+      provider.connection.requestAirdrop(taker.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
+    ]);
+    await confirmTx(payerSig);
+    await confirmTx(takerSig);
+
+    mintA = await createMint(provider.connection, payer, payer.publicKey, null, 6);
+    mintB = await createMint(provider.connection, payer, payer.publicKey, null, 6);
+
+    makerAtaA = (await getOrCreateAssociatedTokenAccount(
+      provider.connection, payer, mintA, maker.publicKey
+    )).address;
+    await mintTo(provider.connection, payer, mintA, makerAtaA, payer.publicKey, 10_000_000_000n);
+
+    takerAtaB = (await getOrCreateAssociatedTokenAccount(
+      provider.connection, payer, mintB, taker.publicKey
+    )).address;
+    await mintTo(provider.connection, payer, mintB, takerAtaB, payer.publicKey, 10_000_000_000n);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 17 ❌ — Take after Refund must fail
+  // ───────────────────────────────────────────────────────────────────────────
+  //
+  // Scenario:
+  //   1. Maker creates an escrow (seed=300)
+  //   2. Maker calls refund() → escrow + vault are CLOSED
+  //   3. Taker tries to call take() on the same escrow PDA
+  //   4. Must FAIL because the escrow account no longer exists
+  //
+  // Why this matters:
+  //   This is the "double-spend" scenario from the maker's side. If a maker
+  //   could refund their tokens AND then a taker could still take the same
+  //   escrow, the maker would get their tokens back twice — once via refund,
+  //   and the taker would get tokens from a vault that should no longer exist.
+  //
+  //   In practice, since refund closes both the escrow PDA and the vault,
+  //   any subsequent take() attempt will fail because:
+  //     a) The escrow PDA doesn't exist → AccountNotInitialized (can't read escrow.maker)
+  //     b) The vault doesn't exist → no tokens to transfer
+  //
+  //   Anchor catches this at the account loading stage — the escrow PDA is
+  //   expected to exist (it has no `init` on take, just `mut + close`), so
+  //   trying to deserialize a non-existent account gives AccountNotInitialized.
+  // ───────────────────────────────────────────────────────────────────────────
+  it("take after refund must fail (escrow already closed)", async () => {
+    const seed = new BN(300);
+
+    // Step 1: Create the escrow
+    const { escrowPda } = await setupEscrow(seed, RECEIVE_AMOUNT, DEPOSIT_AMOUNT);
+
+    // Step 2: Maker refunds — escrow + vault are now closed
+    await refundTx(escrowPda);
+
+    // Sanity: confirm escrow is actually gone
+    const escrowInfo = await provider.connection.getAccountInfo(escrowPda);
+    assert.strictEqual(escrowInfo, null, "Sanity: escrow should be closed after refund");
+
+    // Step 3: Taker tries to take the now-closed escrow
+    try {
+      await takeTx(escrowPda);
+      assert.fail("Take should have failed — escrow was already refunded");
+    } catch (err) {
+      // The escrow PDA no longer exists → Anchor can't deserialize it
+      // This can surface as AccountNotInitialized, or a SendTransaction error
+      // with "account not found" or similar. The exact error depends on which
+      // account Anchor tries to access first.
+      const errStr = err.toString();
+      const isExpected =
+        (err instanceof AnchorError && (
+          err.error.errorCode.code === "AccountNotInitialized" ||
+          err.error.errorCode.code === "AccountDiscriminatorMismatch"
+        )) ||
+        errStr.includes("AccountNotInitialized") ||
+        errStr.includes("account not found") ||
+        errStr.includes("could not find") ||
+        errStr.includes("0xbc4") || // AccountNotInitialized error code
+        errStr.includes("0xbbf");   // AccountDiscriminatorMismatch
+      assert.ok(isExpected, `Expected escrow-not-found error, got: ${errStr}`);
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 18 ❌ — Refund after Take must fail
+  // ───────────────────────────────────────────────────────────────────────────
+  //
+  // Scenario:
+  //   1. Maker creates an escrow (seed=301)
+  //   2. Taker calls take() → tokens swap, escrow + vault are CLOSED
+  //   3. Maker tries to call refund() on the same escrow PDA
+  //   4. Must FAIL because the escrow account no longer exists
+  //
+  // Why this matters:
+  //   This is the "double-spend" scenario from the taker's side. If a taker
+  //   successfully takes an escrow AND then the maker could refund it, the
+  //   trade would be reversed after the fact — the maker gets their mintA
+  //   back while the taker already received them. The mintB they sent is gone.
+  //
+  //   This is fundamentally an atomicity + finality guarantee:
+  //     - take() is FINAL — once executed, the escrow is destroyed
+  //     - refund() can only operate on a LIVE escrow
+  //     - Since take() closes the escrow, refund() has nothing to act on
+  //
+  //   The failure mode is the same as Test 17: the escrow PDA is gone,
+  //   Anchor can't deserialize it → AccountNotInitialized.
+  // ───────────────────────────────────────────────────────────────────────────
+  it("refund after take must fail (escrow already consumed)", async () => {
+    const seed = new BN(301);
+
+    // Step 1: Create the escrow
+    const { escrowPda } = await setupEscrow(seed, RECEIVE_AMOUNT, DEPOSIT_AMOUNT);
+
+    // Step 2: Taker takes — tokens swap, escrow + vault are now closed
+    await takeTx(escrowPda);
+
+    // Sanity: confirm escrow is actually gone
+    const escrowInfo = await provider.connection.getAccountInfo(escrowPda);
+    assert.strictEqual(escrowInfo, null, "Sanity: escrow should be closed after take");
+
+    // Step 3: Maker tries to refund the now-consumed escrow
+    try {
+      await refundTx(escrowPda);
+      assert.fail("Refund should have failed — escrow was already taken");
+    } catch (err) {
+      // Same as Test 17: closed escrow → AccountNotInitialized
+      const errStr = err.toString();
+      const isExpected =
+        (err instanceof AnchorError && (
+          err.error.errorCode.code === "AccountNotInitialized" ||
+          err.error.errorCode.code === "AccountDiscriminatorMismatch"
+        )) ||
+        errStr.includes("AccountNotInitialized") ||
+        errStr.includes("account not found") ||
+        errStr.includes("could not find") ||
+        errStr.includes("0xbc4") ||
+        errStr.includes("0xbbf");
+      assert.ok(isExpected, `Expected escrow-not-found error, got: ${errStr}`);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DESCRIBE: EXPIRY / DEADLINE TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests validate the on-chain expiry mechanism:
+//   - Maker sets `expires_at` (Unix timestamp) at make() time
+//   - Clock::get() is used on-chain to read the current time
+//   - take() is rejected after expiry (EscrowExpired)
+//   - make() is rejected with a past expiry (ExpiryInPast)
+//   - refund() works at any time (before or after expiry)
+//
+// Seed range: 400–410
+// ─────────────────────────────────────────────────────────────────────────────
+describe("expiry / deadline", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace
+    .BlueshiftAnchorEscrow as Program<BlueshiftAnchorEscrow>;
+
+  const maker = provider.wallet;
+  const taker = anchor.web3.Keypair.generate();
+  const payer = anchor.web3.Keypair.generate();
+
+  let mintA: anchor.web3.PublicKey;
+  let mintB: anchor.web3.PublicKey;
+  let makerAtaA: anchor.web3.PublicKey;
+  let takerAtaB: anchor.web3.PublicKey;
+
+  const DEPOSIT_AMOUNT = new BN(500_000);
+  const RECEIVE_AMOUNT = new BN(200_000);
+
+  const confirmTx = async (sig: string) => {
+    const bh = await provider.connection.getLatestBlockhash();
+    await provider.connection.confirmTransaction({ signature: sig, ...bh });
+  };
+
+  // ── Helper: create escrow via make() ──────────────────────────────────────
+  const setupEscrow = async (
+    seed: BNType,
+    receive: BNType,
+    amount: BNType,
+    expiresAt: BNType // required here — tests set explicit values
+  ) => {
+    const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+
+    await program.methods
+      .make(seed, receive, amount, expiresAt)
+      .accounts({
+        maker: maker.publicKey,
+        mintA,
+        mintB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      } as any)
+      .rpc();
+
+    return { escrowPda, vault };
+  };
+
+  // ── Helper: call take() ───────────────────────────────────────────────────
+  const takeTx = async (escrowPda: anchor.web3.PublicKey) => {
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
+    const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
+    const makerAtaB = await getAssociatedTokenAddress(mintB, maker.publicKey);
+
+    await program.methods
+      .take()
+      .accounts({
+        taker: taker.publicKey,
+        maker: maker.publicKey,
+        escrow: escrowPda,
+        mintA,
+        mintB,
+        vault,
+        takerAtaA,
+        takerAtaB: activeTakerAtaB,
+        makerAtaB,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      } as any)
+      .signers([taker])
+      .rpc();
+  };
+
+  // ── Helper: call refund() ─────────────────────────────────────────────────
+  const refundTx = async (escrowPda: anchor.web3.PublicKey) => {
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+
+    await program.methods
+      .refund()
+      .accounts({
+        maker: maker.publicKey,
+        escrow: escrowPda,
+        mintA,
+        vault,
+        makerAtaA: await getAssociatedTokenAddress(mintA, maker.publicKey),
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      } as any)
+      .rpc();
+  };
+
+  // ── BEFORE ──────────────────────────────────────────────────────────────────
+  before(async () => {
+    const [payerSig, takerSig] = await Promise.all([
+      provider.connection.requestAirdrop(payer.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
+      provider.connection.requestAirdrop(taker.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
+    ]);
+    await confirmTx(payerSig);
+    await confirmTx(takerSig);
+
+    mintA = await createMint(provider.connection, payer, payer.publicKey, null, 6);
+    mintB = await createMint(provider.connection, payer, payer.publicKey, null, 6);
+
+    makerAtaA = (await getOrCreateAssociatedTokenAccount(
+      provider.connection, payer, mintA, maker.publicKey
+    )).address;
+    await mintTo(provider.connection, payer, mintA, makerAtaA, payer.publicKey, 10_000_000_000n);
+
+    takerAtaB = (await getOrCreateAssociatedTokenAccount(
+      provider.connection, payer, mintB, taker.publicKey
+    )).address;
+    await mintTo(provider.connection, payer, mintB, takerAtaB, payer.publicKey, 10_000_000_000n);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 19 ✅ — Happy path: escrow with future expiry, take succeeds
+  // ───────────────────────────────────────────────────────────────────────────
+  it("happy path: take succeeds when escrow has not expired", async () => {
+    // Expiry 1 hour from now — well in the future
+    const futureExpiry = new BN(Math.floor(Date.now() / 1000) + 3600);
+
+    const { escrowPda } = await setupEscrow(
+      new BN(400), RECEIVE_AMOUNT, DEPOSIT_AMOUNT, futureExpiry
+    );
+
+    // Verify expires_at was stored correctly
+    const escrow = await program.account.escrow.fetch(escrowPda);
+    assert.equal(
+      escrow.expiresAt.toString(),
+      futureExpiry.toString(),
+      "expires_at should match the value passed to make"
+    );
+
+    // Take should succeed — escrow hasn't expired
+    await takeTx(escrowPda);
+
+    // Escrow should be closed after take
+    const escrowInfo = await provider.connection.getAccountInfo(escrowPda);
+    assert.strictEqual(escrowInfo, null, "Escrow should be closed after successful take");
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 20 ❌ — make() with expiry in the past must fail (ExpiryInPast)
+  // ───────────────────────────────────────────────────────────────────────────
+  it("make rejects expires_at in the past (ExpiryInPast)", async () => {
+    // Set expiry to 1 hour AGO — clearly in the past
+    const pastExpiry = new BN(Math.floor(Date.now() / 1000) - 3600);
+
+    try {
+      await setupEscrow(new BN(401), RECEIVE_AMOUNT, DEPOSIT_AMOUNT, pastExpiry);
+      assert.fail("make() should have rejected past expiry");
+    } catch (err) {
+      assert.ok(err instanceof AnchorError, `Expected AnchorError, got: ${err}`);
+      assert.strictEqual(
+        err.error.errorCode.code,
+        "ExpiryInPast",
+        `Expected ExpiryInPast, got: ${err.error.errorCode.code}`
+      );
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 21 ❌ — take() on an expired escrow must fail (EscrowExpired)
+  // ───────────────────────────────────────────────────────────────────────────
+  //
+  // Strategy: We create an escrow with `expires_at` set to just 2 seconds
+  // from now, then wait 3 seconds before calling take(). By the time take()
+  // runs, the on-chain Clock will be past the expiry timestamp.
+  //
+  // Note: In solana-test-validator, the clock advances ~1 slot per 400ms,
+  // and unix_timestamp roughly tracks real wall-clock time. The 3-second
+  // wait gives a comfortable margin.
+  // ───────────────────────────────────────────────────────────────────────────
+  it("take rejects an expired escrow (EscrowExpired)", async () => {
+    // Expiry in 2 seconds — just enough time for make() to land
+    const shortExpiry = new BN(Math.floor(Date.now() / 1000) + 2);
+
+    const { escrowPda } = await setupEscrow(
+      new BN(402), RECEIVE_AMOUNT, DEPOSIT_AMOUNT, shortExpiry
+    );
+
+    // Wait 3 seconds so the escrow expires
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    try {
+      await takeTx(escrowPda);
+      assert.fail("take() should have failed — escrow has expired");
+    } catch (err) {
+      assert.ok(err instanceof AnchorError, `Expected AnchorError, got: ${err}`);
+      assert.strictEqual(
+        err.error.errorCode.code,
+        "EscrowExpired",
+        `Expected EscrowExpired, got: ${err.error.errorCode.code}`
+      );
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 22 ✅ — refund() works EVEN on an expired escrow
+  // ───────────────────────────────────────────────────────────────────────────
+  //
+  // The maker should ALWAYS be able to get their tokens back, regardless of
+  // whether the escrow has expired or not. Expiry only prevents takers from
+  // taking — it doesn't lock the maker out.
+  // ───────────────────────────────────────────────────────────────────────────
+  it("refund succeeds even after escrow has expired", async () => {
+    // Expiry in 2 seconds
+    const shortExpiry = new BN(Math.floor(Date.now() / 1000) + 2);
+
+    const balanceBefore = (await getAccount(provider.connection, makerAtaA)).amount;
+
+    const { escrowPda } = await setupEscrow(
+      new BN(403), RECEIVE_AMOUNT, DEPOSIT_AMOUNT, shortExpiry
+    );
+
+    // Balance decreased after make
+    const balanceAfterMake = (await getAccount(provider.connection, makerAtaA)).amount;
+    assert.equal(
+      balanceAfterMake,
+      balanceBefore - BigInt(DEPOSIT_AMOUNT.toString()),
+      "Sanity: maker ATA should decrease after make"
+    );
+
+    // Wait 3 seconds so the escrow expires
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    // Refund should still work — maker can always reclaim
+    await refundTx(escrowPda);
+
+    // Balance fully restored
+    const balanceAfterRefund = (await getAccount(provider.connection, makerAtaA)).amount;
+    assert.equal(balanceAfterRefund, balanceBefore, "Maker ATA should be fully restored after refund");
+
+    // Escrow closed
+    const escrowInfo = await provider.connection.getAccountInfo(escrowPda);
+    assert.strictEqual(escrowInfo, null, "Escrow PDA should be closed after refund");
   });
 });
