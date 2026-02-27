@@ -63,16 +63,17 @@ pub struct Make<'info> {
 
 impl <'info> Make<'info> {
     // create escrow 
-    fn populate_escrow(&mut self, seed: u64, amount: u64, bump: u8, expires_at: i64, fee_bps: u16) -> Result<()> {
+    fn populate_escrow(&mut self, seed: u64, receive: u64, deposit_amount: u64, bump: u8, expires_at: i64, fee_bps: u16) -> Result<()> {
         self.escrow.set_inner(Escrow {
             seed,
             maker: self.maker.key(),
             mint_a: self.mint_a.key(),
             mint_b: self.mint_b.key(),
-            receive: amount,
+            receive,
             bump,
             expires_at,
             fee_bps,
+            deposit_amount,
         });
         Ok(())
     }
@@ -108,7 +109,7 @@ pub fn handler (ctx: Context<Make>, seed: u64, receive: u64, amount: u64, expire
     // validate fee bps (0–10000 = 0%–100%)
     require!(fee_bps <= 10_000, EscrowError::InvalidFeeBps);
 
-    ctx.accounts.populate_escrow(seed, receive, ctx.bumps.escrow, expires_at, fee_bps)?;
+    ctx.accounts.populate_escrow(seed, receive, amount, ctx.bumps.escrow, expires_at, fee_bps)?;
     ctx.accounts.deposit_tokens(amount)?;
 
     Ok(())

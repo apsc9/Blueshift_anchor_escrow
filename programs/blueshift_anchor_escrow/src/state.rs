@@ -11,4 +11,5 @@ pub struct Escrow {
     pub bump: u8,
     pub expires_at: i64,
     pub fee_bps: u16,
+    pub deposit_amount: u64,
 }

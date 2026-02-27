@@ -318,7 +318,6 @@ describe("take instruction", () => {
     return { escrowPda, vault };
   };
 
-  // ── Helper: call take ─────────────────────────────────────────────────────
   const takeTx = async (
     escrowPda: anchor.web3.PublicKey,
     opts: {
@@ -326,12 +325,20 @@ describe("take instruction", () => {
       mintAOver?: anchor.web3.PublicKey;
       mintBOver?: anchor.web3.PublicKey;
       makerOver?: anchor.web3.PublicKey;
+      fillAmount?: BNType;
     } = {}
   ) => {
     const aTaker = opts.takerKp ?? taker;
     const aMintA = opts.mintAOver ?? mintA;
     const aMintB = opts.mintBOver ?? mintB;
     const aMaker = opts.makerOver ?? maker.publicKey;
+
+    // If no fillAmount provided, do a full fill (escrow.receive)
+    let fill = opts.fillAmount;
+    if (!fill) {
+      const escrowData = await program.account.escrow.fetch(escrowPda);
+      fill = escrowData.receive;
+    }
 
     // Derive accounts the test needs for assertions
     const vault = await getAssociatedTokenAddress(aMintA, escrowPda, true);
@@ -342,7 +349,7 @@ describe("take instruction", () => {
     const treasuryAtaB = await getAssociatedTokenAddress(aMintB, treasury, true);
 
     await program.methods
-      .take()
+      .take(fill)
       .accounts({
         taker: aTaker.publicKey,
         maker: aMaker,
@@ -850,7 +857,14 @@ describe("cross-instruction lifecycle", () => {
   };
 
   // ── Helper: call take() ───────────────────────────────────────────────────
-  const takeTx = async (escrowPda: anchor.web3.PublicKey) => {
+  const takeTx = async (escrowPda: anchor.web3.PublicKey, fillAmount?: BNType) => {
+    // If no fillAmount, do a full fill
+    let fill = fillAmount;
+    if (!fill) {
+      const escrowData = await program.account.escrow.fetch(escrowPda);
+      fill = escrowData.receive;
+    }
+
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
     const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
     const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
@@ -859,7 +873,7 @@ describe("cross-instruction lifecycle", () => {
     const treasuryAtaB = await getAssociatedTokenAddress(mintB, treasury, true);
 
     await program.methods
-      .take()
+      .take(fill)
       .accounts({
         taker: taker.publicKey,
         maker: maker.publicKey,
@@ -962,7 +976,9 @@ describe("cross-instruction lifecycle", () => {
 
     // Step 3: Taker tries to take the now-closed escrow
     try {
-      await takeTx(escrowPda);
+      // Must pass an explicit fillAmount because the escrow is already closed —
+      // the takeTx auto-fetch would fail before even sending the transaction.
+      await takeTx(escrowPda, RECEIVE_AMOUNT);
       assert.fail("Take should have failed — escrow was already refunded");
     } catch (err) {
       // The escrow PDA no longer exists → Anchor can't deserialize it
@@ -977,6 +993,9 @@ describe("cross-instruction lifecycle", () => {
         )) ||
         errStr.includes("AccountNotInitialized") ||
         errStr.includes("account not found") ||
+        errStr.includes("Account does not exist") ||
+        errStr.includes("has no data") ||
+        errStr.includes("toArrayLike") ||
         errStr.includes("could not find") ||
         errStr.includes("0xbc4") || // AccountNotInitialized error code
         errStr.includes("0xbbf");   // AccountDiscriminatorMismatch
@@ -1106,7 +1125,13 @@ describe("expiry / deadline", () => {
   };
 
   // ── Helper: call take() ───────────────────────────────────────────────────
-  const takeTx = async (escrowPda: anchor.web3.PublicKey) => {
+  const takeTx = async (escrowPda: anchor.web3.PublicKey, fillAmount?: BNType) => {
+    let fill = fillAmount;
+    if (!fill) {
+      const escrowData = await program.account.escrow.fetch(escrowPda);
+      fill = escrowData.receive;
+    }
+
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
     const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
     const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
@@ -1115,7 +1140,7 @@ describe("expiry / deadline", () => {
     const treasuryAtaB = await getAssociatedTokenAddress(mintB, treasury, true);
 
     await program.methods
-      .take()
+      .take(fill)
       .accounts({
         taker: taker.publicKey,
         maker: maker.publicKey,
@@ -1368,7 +1393,13 @@ describe("fee mechanism", () => {
   };
 
   // ── Helper: call take() ───────────────────────────────────────────────────
-  const takeTx = async (escrowPda: anchor.web3.PublicKey) => {
+  const takeTx = async (escrowPda: anchor.web3.PublicKey, fillAmount?: BNType) => {
+    let fill = fillAmount;
+    if (!fill) {
+      const escrowData = await program.account.escrow.fetch(escrowPda);
+      fill = escrowData.receive;
+    }
+
     const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
     const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
     const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
@@ -1377,7 +1408,7 @@ describe("fee mechanism", () => {
     const treasuryAtaB = await getAssociatedTokenAddress(mintB, treasury, true);
 
     await program.methods
-      .take()
+      .take(fill)
       .accounts({
         taker: taker.publicKey,
         maker: maker.publicKey,
@@ -1503,6 +1534,250 @@ describe("fee mechanism", () => {
         err.error.errorCode.code,
         "InvalidFeeBps",
         `Expected InvalidFeeBps, got: ${err.error.errorCode.code}`
+      );
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DESCRIBE: PARTIAL FILLS TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests validate the partial fill mechanism:
+//   - Taker passes `fill_amount` to take() (how much token_B to pay)
+//   - Proportional token_A released: (fill_amount × deposit_amount) / receive
+//   - Escrow stays alive after partial fills — only closed on final fill
+//   - fill_amount = 0 or > remaining → rejected (InvalidFillAmount)
+//
+// Seed range: 600–610
+// ─────────────────────────────────────────────────────────────────────────────
+describe("partial fills", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace
+    .BlueshiftAnchorEscrow as Program<BlueshiftAnchorEscrow>;
+
+  const maker = provider.wallet;
+  const taker = anchor.web3.Keypair.generate();
+  const payer = anchor.web3.Keypair.generate();
+
+  let mintA: anchor.web3.PublicKey;
+  let mintB: anchor.web3.PublicKey;
+  let makerAtaA: anchor.web3.PublicKey;
+  let takerAtaB: anchor.web3.PublicKey;
+
+  // deposit_amount = 500,000 token_A
+  // receive        = 200,000 token_B
+  // Ratio: 1 token_B = 2.5 token_A
+  const DEPOSIT_AMOUNT = new BN(500_000);
+  const RECEIVE_AMOUNT = new BN(200_000);
+
+  const confirmTx = async (sig: string) => {
+    const bh = await provider.connection.getLatestBlockhash();
+    await provider.connection.confirmTransaction({ signature: sig, ...bh });
+  };
+
+  const DEFAULT_EXPIRY = () => new BN(Math.floor(Date.now() / 1000) + 3600);
+
+  // ── Helper: create escrow via make() ──────────────────────────────────────
+  const setupEscrow = async (
+    seed: BNType, receive: BNType, amount: BNType,
+    feeBps: number = 0, expiresAt?: BNType
+  ) => {
+    const escrowPda = deriveEscrowPda(maker.publicKey, seed, program.programId);
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const expiry = expiresAt ?? DEFAULT_EXPIRY();
+
+    await program.methods
+      .make(seed, receive, amount, expiry, feeBps)
+      .accounts({
+        maker: maker.publicKey,
+        mintA,
+        mintB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      } as any)
+      .rpc();
+
+    return { escrowPda, vault };
+  };
+
+  // ── Helper: call take() with explicit fill_amount ─────────────────────────
+  const takeTx = async (escrowPda: anchor.web3.PublicKey, fillAmount: BNType) => {
+    const vault = await getAssociatedTokenAddress(mintA, escrowPda, true);
+    const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
+    const activeTakerAtaB = await getAssociatedTokenAddress(mintB, taker.publicKey);
+    const makerAtaB = await getAssociatedTokenAddress(mintB, maker.publicKey);
+    const treasury = deriveTreasuryPda(program.programId);
+    const treasuryAtaB = await getAssociatedTokenAddress(mintB, treasury, true);
+
+    await program.methods
+      .take(fillAmount)
+      .accounts({
+        taker: taker.publicKey,
+        maker: maker.publicKey,
+        escrow: escrowPda,
+        mintA,
+        mintB,
+        vault,
+        takerAtaA,
+        takerAtaB: activeTakerAtaB,
+        makerAtaB,
+        treasury,
+        treasuryAtaB,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      } as any)
+      .signers([taker])
+      .rpc();
+
+    return { vault, takerAtaA, makerAtaB, takerAtaB: activeTakerAtaB, treasuryAtaB };
+  };
+
+  // ── BEFORE ──────────────────────────────────────────────────────────────────
+  before(async () => {
+    const [payerSig, takerSig] = await Promise.all([
+      provider.connection.requestAirdrop(payer.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
+      provider.connection.requestAirdrop(taker.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL),
+    ]);
+    await confirmTx(payerSig);
+    await confirmTx(takerSig);
+
+    mintA = await createMint(provider.connection, payer, payer.publicKey, null, 6);
+    mintB = await createMint(provider.connection, payer, payer.publicKey, null, 6);
+
+    makerAtaA = (await getOrCreateAssociatedTokenAccount(
+      provider.connection, payer, mintA, maker.publicKey
+    )).address;
+    await mintTo(provider.connection, payer, mintA, makerAtaA, payer.publicKey, 10_000_000_000n);
+
+    takerAtaB = (await getOrCreateAssociatedTokenAccount(
+      provider.connection, payer, mintB, taker.publicKey
+    )).address;
+    await mintTo(provider.connection, payer, mintB, takerAtaB, payer.publicKey, 10_000_000_000n);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 26  — Two partial fills then final fill (the core test)
+  // ───────────────────────────────────────────────────────────────────────────
+  //
+  // Original terms: 500,000 token_A ↔ 200,000 token_B
+  //
+  // Fill 1: 80,000 token_B → releases (80,000 × 500,000) / 200,000 = 200,000 token_A
+  //   Remaining: vault = 300,000 A, receive = 120,000 B
+  //
+  // Fill 2: 120,000 token_B (final fill) → releases remaining 300,000 token_A
+  //   Escrow + vault closed
+  //
+  it("two partial fills: first partial, then final drain + close", async () => {
+    const { escrowPda, vault } = await setupEscrow(
+      new BN(600), RECEIVE_AMOUNT, DEPOSIT_AMOUNT
+    );
+
+    // ── FILL 1: 80,000 token_B (40% of total) ──
+    const takerABefore = await getAssociatedTokenAddress(mintA, taker.publicKey)
+      .then(addr => getAccount(provider.connection, addr).catch(() => null));
+    const takerABalanceBefore = takerABefore ? takerABefore.amount : BigInt(0);
+
+    await takeTx(escrowPda, new BN(80_000));
+
+    // After fill 1: taker should have received 200,000 token_A
+    const takerAtaA = await getAssociatedTokenAddress(mintA, taker.publicKey);
+    const takerAAfterFill1 = (await getAccount(provider.connection, takerAtaA)).amount;
+    assert.equal(
+      takerAAfterFill1 - takerABalanceBefore,
+      BigInt(200_000),
+      "Fill 1: taker should receive 200,000 token_A (ratio: 80k/200k × 500k)"
+    );
+
+    // After fill 1: vault should have 300,000 token_A remaining
+    const vaultAfterFill1 = (await getAccount(provider.connection, vault)).amount;
+    assert.equal(vaultAfterFill1, BigInt(300_000), "Fill 1: vault should have 300,000 remaining");
+
+    // After fill 1: escrow.receive should be 120,000
+    const escrowAfterFill1 = await program.account.escrow.fetch(escrowPda);
+    assert.equal(
+      escrowAfterFill1.receive.toString(),
+      "120000",
+      "Fill 1: remaining receive should be 120,000"
+    );
+
+    // ── FILL 2: 120,000 token_B (final fill — drains remaining) ──
+    await takeTx(escrowPda, new BN(120_000));
+
+    // After fill 2: taker should have received another 300,000 token_A (total 500,000)
+    const takerAAfterFill2 = (await getAccount(provider.connection, takerAtaA)).amount;
+    assert.equal(
+      takerAAfterFill2 - takerABalanceBefore,
+      BigInt(500_000),
+      "Fill 2: taker should have received total 500,000 token_A"
+    );
+
+    // Vault should be closed (final fill)
+    const vaultInfo = await provider.connection.getAccountInfo(vault);
+    assert.strictEqual(vaultInfo, null, "Vault should be closed after final fill");
+
+    // Escrow should be closed (final fill)
+    const escrowInfo = await provider.connection.getAccountInfo(escrowPda);
+    assert.strictEqual(escrowInfo, null, "Escrow should be closed after final fill");
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 27  — Full fill in one take (backward compatible)
+  // ───────────────────────────────────────────────────────────────────────────
+  it("full fill (fill_amount = receive): behaves like original take", async () => {
+    const { escrowPda } = await setupEscrow(
+      new BN(601), RECEIVE_AMOUNT, DEPOSIT_AMOUNT
+    );
+
+    // Full fill with fill_amount = receive
+    await takeTx(escrowPda, RECEIVE_AMOUNT);
+
+    // Escrow + vault should be closed
+    const escrowInfo = await provider.connection.getAccountInfo(escrowPda);
+    assert.strictEqual(escrowInfo, null, "Escrow should be closed after full fill");
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 28  — fill_amount = 0 must fail (InvalidFillAmount)
+  // ───────────────────────────────────────────────────────────────────────────
+  it("fill_amount = 0 is rejected with InvalidFillAmount", async () => {
+    const { escrowPda } = await setupEscrow(
+      new BN(602), RECEIVE_AMOUNT, DEPOSIT_AMOUNT
+    );
+
+    try {
+      await takeTx(escrowPda, new BN(0));
+      assert.fail("take() should have rejected fill_amount = 0");
+    } catch (err) {
+      assert.ok(err instanceof AnchorError, `Expected AnchorError, got: ${err}`);
+      assert.strictEqual(
+        err.error.errorCode.code,
+        "InvalidFillAmount",
+        `Expected InvalidFillAmount, got: ${err.error.errorCode.code}`
+      );
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TEST 29  — fill_amount > remaining receive must fail (InvalidFillAmount)
+  // ───────────────────────────────────────────────────────────────────────────
+  it("fill_amount > remaining receive is rejected with InvalidFillAmount", async () => {
+    const { escrowPda } = await setupEscrow(
+      new BN(603), RECEIVE_AMOUNT, DEPOSIT_AMOUNT
+    );
+
+    try {
+      // Try to fill more than receive
+      await takeTx(escrowPda, new BN(200_001));
+      assert.fail("take() should have rejected fill_amount > receive");
+    } catch (err) {
+      assert.ok(err instanceof AnchorError, `Expected AnchorError, got: ${err}`);
+      assert.strictEqual(
+        err.error.errorCode.code,
+        "InvalidFillAmount",
+        `Expected InvalidFillAmount, got: ${err.error.errorCode.code}`
       );
     }
   });

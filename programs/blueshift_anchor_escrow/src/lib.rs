@@ -16,8 +16,8 @@ pub mod blueshift_anchor_escrow {
         instructions::make::handler(ctx, seed, receive, amount, expires_at, fee_bps)
     }
     #[instruction(discriminator = 1)]
-    pub fn take(ctx: Context<Take>) -> Result<()> {
-        instructions::take::handler(ctx)
+    pub fn take(ctx: Context<Take>, fill_amount: u64) -> Result<()> {
+        instructions::take::handler(ctx, fill_amount)
     }
 
     #[instruction(discriminator = 2)]

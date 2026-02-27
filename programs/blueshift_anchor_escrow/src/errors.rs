@@ -15,4 +15,6 @@ pub enum EscrowError {
     ExpiryInPast,
     #[msg("Fee basis points must be <= 10000")]
     InvalidFeeBps,
+    #[msg("Fill amount must be > 0 and <= remaining receive")]
+    InvalidFillAmount,
 }
