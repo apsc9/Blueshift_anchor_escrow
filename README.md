@@ -1,87 +1,77 @@
 # Blueshift Anchor Escrow
 
-A decentralized escrow application built on Solana using the [Anchor Framework](https://www.anchor-lang.com/). This program allows two parties to exchange SPL tokens trustlessly.
+A decentralized escrow program on Solana using [Anchor](https://www.anchor-lang.com/). Two parties exchange SPL tokens trustlessly, with support for expiry deadlines, protocol fees, and partial fills.
 
 ## Overview
 
-The Blueshift Anchor Escrow program facilitates a secure token swap between a **Maker** and a **Taker**.
-1.  **Maker:** Initiates the escrow by depositing Token A and specifying the amount of Token B they want in return.
-2.  **Taker:** Fulfills the order by sending the requested amount of Token B to the Maker, receiving Token A in exchange.
-3.  **Refund:** The Maker can withdraw their tokens and close the escrow if the offer has not yet been taken.
+1. **Maker** creates an escrow — deposits Token A, sets how much Token B they want, a deadline, and an optional fee.
+2. **Taker** fills the escrow (fully or partially) — sends Token B, receives proportional Token A.
+3. **Refund** — Maker can cancel and reclaim tokens at any time.
 
 ## Features
 
--   **Make:** Create an escrow offer, deposit tokens into a vault, and set exchange terms.
--   **Take:** Accept an escrow offer, transfer the required tokens to the maker, and receive the deposited tokens.
--   **Refund:** Cancel an active escrow and retrieve deposited tokens.
--   **Secure Vault:** Tokens are held in a Program Derived Address (PDA) controlled vault, ensuring they can only be moved according to the program's logic.
+- **Expiry / Deadline** — Maker sets an `expires_at` timestamp. Expired escrows cannot be taken but can always be refunded.
+- **Protocol Fees** — Maker sets `fee_bps` (0–10,000 = 0%–100%). On take, fee is deducted from the Token B payment and sent to a treasury PDA.
+- **Partial Fills** — Taker specifies `fill_amount` (how much Token B to pay). Proportional Token A is released; escrow stays alive until fully filled.
+- **Secure Vault** — Tokens are held in a PDA-controlled vault, movable only by program logic.
 
 ## Architecture
 
-### Accounts
+### Escrow State
 
--   **Escrow Account:** A PDA that stores the terms of the trade (Maker, Mints, Receive Amount, Seed, Bump).
-    -   Seeds: `[b"escrow", maker_pubkey, seed_u64]`
--   **Vault:** An Associated Token Account (ATA) owned by the Escrow PDA that holds the Maker's deposited tokens (Token A).
+| Field | Type | Description |
+|-------|------|-------------|
+| `seed` | `u64` | Unique seed per maker |
+| `maker` | `Pubkey` | Creator of the escrow |
+| `mint_a` | `Pubkey` | Token deposited by maker |
+| `mint_b` | `Pubkey` | Token expected from taker |
+| `receive` | `u64` | Remaining Token B needed (decreases with partial fills) |
+| `deposit_amount` | `u64` | Original Token A deposited (immutable, for reference) |
+| `expires_at` | `i64` | Unix timestamp deadline |
+| `fee_bps` | `u16` | Fee in basis points |
+| `bump` | `u8` | PDA bump |
 
 ### Instructions
 
-1.  **`make`**:
-    -   Initializes the `Escrow` account.
-    -   Creates a `Vault` account (ATA for Mint A, owned by Escrow PDA).
-    -   Transfers the specified `amount` of Token A from Maker to Vault.
-    -   Sets the `receive` amount (Token B expected).
+**`make(seed, receive, amount, expires_at, fee_bps)`**
+- Creates the escrow PDA and vault
+- Deposits `amount` of Token A into the vault
+- Validates `expires_at` is in the future and `fee_bps ≤ 10,000`
 
-2.  **`take`**:
-    -   Verifies the Taker sends the correct amount of Token B to the Maker.
-    -   Transfers Token A from the Vault to the Taker.
-    -   Closes the Vault and Escrow accounts, refunding rent to the Maker.
+**`take(fill_amount)`**
+- Validates escrow is not expired and `0 < fill_amount ≤ remaining receive`
+- Computes proportional Token A: `(fill_amount × vault.amount) / remaining_receive`
+- Transfers `fill_amount - fee` of Token B to maker, fee to treasury
+- On final fill (fully consumed): closes vault and escrow, returns rent to maker
 
-3.  **`refund`**:
-    -   Allows the Maker to cancel the trade.
-    -   Transfers Token A from the Vault back to the Maker.
-    -   Closes the Vault and Escrow accounts, refunding rent to the Maker.
+**`refund`**
+- Maker-only — returns Token A from vault, closes vault and escrow
 
 ## Getting Started
 
 ### Prerequisites
 
--   [Rust](https://www.rust-lang.org/tools/install)
--   [Solana CLI](https://docs.solana.com/cli/install-solana-cli-tools)
--   [Anchor](https://www.anchor-lang.com/docs/installation)
--   [Node.js](https://nodejs.org/) & [Yarn](https://yarnpkg.com/)
+- [Rust](https://www.rust-lang.org/tools/install)
+- [Solana CLI](https://docs.solana.com/cli/install-solana-cli-tools)
+- [Anchor](https://www.anchor-lang.com/docs/installation)
+- [Node.js](https://nodejs.org/) & [Yarn](https://yarnpkg.com/)
 
 ### Installation
 
-1.  Clone the repository:
-    ```bash
-    git clone <repository-url>
-    cd blueshift_anchor_escrow
-    ```
-
-2.  Install dependencies:
-    ```bash
-    yarn install
-    ```
-
-3.  Build the program:
-    ```bash
-    anchor build
-    ```
+```bash
+git clone <repository-url>
+cd blueshift_anchor_escrow
+yarn install
+anchor build
+```
 
 ### Testing
 
-The project includes a comprehensive test suite using TypeScript and Mocha.
+29 tests covering make, take, refund, cross-instruction lifecycle, expiry, fees, and partial fills.
 
-1.  **Important:** Ensure you have the `@solana/spl-token` dependency installed for tests to run correctly.
-    ```bash
-    yarn add @solana/spl-token
-    ```
-
-2.  Run the tests:
-    ```bash
-    anchor test
-    ```
+```bash
+anchor test
+```
 
 ## Directory Structure
 
